@@ -174,7 +174,13 @@ async function handleSignIn(event, context = "overlay") {
     btn.textContent = "Signing in...";
   }
 
-  const { data, error } = await signIn(email, password, rememberMe);
+  let result;
+  try {
+    result = await signIn(email, password, rememberMe);
+  } catch (e) {
+    result = { error: { message: e.message || "Sign in failed." } };
+  }
+  const { data, error } = result || {};
 
   if (btn) {
     btn.disabled = false;

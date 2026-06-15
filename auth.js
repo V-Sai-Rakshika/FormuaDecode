@@ -6,6 +6,7 @@ const SUPABASE_URL = FD_CONFIG.supabaseUrl;
 const SUPABASE_ANON_KEY = FD_CONFIG.supabaseAnonKey;
 
 let _fdClient = null;
+let _signingOut = false;
 
 function initSupabase() {
   if (typeof window.supabase !== "undefined") {
@@ -14,6 +15,17 @@ function initSupabase() {
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: true,
+        storageKey: "fd-auth",
+      },
+      global: {
+        fetch: (...args) => {
+          return Promise.race([
+            fetch(...args),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("Request timeout")), 8000),
+            ),
+          ]);
+        },
       },
     });
   } else {
@@ -155,16 +167,37 @@ async function signIn(email, password, rememberMe = false) {
     return { error: { message: "Auth service not initialized." } };
 
   try {
-    const { data, error } = await _fdClient.auth.signInWithPassword({
+    const signInPromise = _fdClient.auth.signInWithPassword({
       email: email.trim().toLowerCase(),
       password,
     });
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new Error(
+              "Sign in timed out. Please check your connection and try again.",
+            ),
+          ),
+        10000,
+      ),
+    );
+    const { data, error } = await Promise.race([signInPromise, timeoutPromise]);
     if (error) return { error };
     if (data.user) {
-      const profile = await fetchUserProfile(data.user.id);
+      // Set user immediately — don't wait for profile
       FD_Auth.setUser(data.user);
-      FD_Auth.setProfile(profile);
-      handlePostAuth(data.user, profile);
+      // Route immediately — don't make user wait for profile
+      handlePostAuth(data.user, null);
+      // Then load profile + data silently in background
+      fetchUserProfile(data.user.id).then((profile) => {
+        FD_Auth.setProfile(profile);
+        if (profile?.onboarding_completed && profile?.onboarding_answers) {
+          DD.profile = buildProfileFromAnswers(profile.onboarding_answers);
+        }
+        loadScansFromDB();
+        renderDashboard();
+      });
     }
     return { data };
   } catch (err) {
@@ -212,14 +245,55 @@ async function sendPasswordReset(email) {
 
 // ── Sign Out ──────────────────────────────────────────────────
 async function signOut() {
-  if (!_fdClient) return;
-  await _fdClient.auth.signOut();
-  FD_Auth.setUser(null);
-  FD_Auth.setProfile(null);
-  updateNavAvatar();
+  _signingOut = true;
+
+  // Don't await Supabase — it hangs. Fire and forget.
+  if (_fdClient) {
+    _fdClient.auth.signOut({ scope: "local" }).catch(() => {});
+  }
+
+  // Clear localStorage immediately
+  try {
+    Object.keys(localStorage).forEach((key) => {
+      if (
+        key.startsWith("sb-") ||
+        key.includes("supabase") ||
+        key === "fd-auth"
+      ) {
+        localStorage.removeItem(key);
+      }
+    });
+    localStorage.removeItem("fd-state");
+    localStorage.removeItem("fd-auth");
+  } catch (e) {}
+
+  // Clear all state
+  FD_Auth.currentUser = null;
+  FD_Auth.userProfile = null;
+  DD.state.scanHistory = [];
+  DD.state.savedProducts = [];
+  DD.state.favorites = [];
+  DD.state.compareList = [];
+  DD.state.currentProduct = null;
+  DD.profile = null;
+
+  // Update avatar
+  const avatar = document.getElementById("nav-avatar");
+  if (avatar) {
+    avatar.textContent = "?";
+    avatar.onclick = () => showAuthModal("login");
+  }
+
+  // Navigate to dashboard
   showPage("dashboard");
   renderDashboard();
+
+  setTimeout(() => {
+    _signingOut = false;
+  }, 3000);
 }
+
+window.signOut = signOut;
 
 // ── User Profile CRUD ─────────────────────────────────────────
 async function createUserProfile(userId, data) {
@@ -320,7 +394,7 @@ function initAuthListener() {
   if (!_fdClient) return;
 
   _fdClient.auth.onAuthStateChange(async (event, session) => {
-    if (event === "SIGNED_IN" && session?.user) {
+    if (event === "SIGNED_IN" && session?.user && !_signingOut) {
       FD_Auth.setUser(session.user);
 
       let profile = await fetchUserProfile(session.user.id);
@@ -357,6 +431,8 @@ function handlePostAuth(user, profile) {
   showPage("dashboard");
   renderDashboard();
   updateNavAvatar();
+  // Load scan history from DB
+  loadScansFromDB();
 }
 
 // ── Personalized Analysis CTA ─────────────────────────────────
@@ -443,59 +519,163 @@ function updateNavAvatar() {
 // ── Init ──────────────────────────────────────────────────────
 async function initAuth() {
   initSupabase();
-  initAuthListener();
 
-  // Load persisted state BEFORE rendering dashboard
-  if (typeof loadState === "function") loadState();
+  if (!_fdClient) {
+    showMainApp();
+    showPage("dashboard");
+    renderDashboard();
+    return;
+  }
 
-  showMainApp();
-  showPage("dashboard");
-  renderDashboard();
-
-  if (!_fdClient) return;
-
+  // Check session FIRST before doing anything
   const {
     data: { session },
   } = await _fdClient.auth.getSession();
+
   if (session?.user) {
+    // User is logged in — load everything before rendering
     FD_Auth.setUser(session.user);
+    updateNavAvatar();
+    showMainApp();
+
     const profile = await fetchUserProfile(session.user.id);
     FD_Auth.setProfile(profile);
-    updateNavAvatar();
+
+    if (profile?.onboarding_completed && profile?.onboarding_answers) {
+      DD.profile = buildProfileFromAnswers(profile.onboarding_answers);
+    }
+
+    showPage("dashboard");
+    renderDashboard();
+    loadScansFromDB();
+  } else {
+    // No session — show guest dashboard
+    showMainApp();
+    showPage("dashboard");
+    renderDashboard();
   }
 
-  // Re-render after state + session both loaded
-  renderDashboard();
-  // If user is on history page, refresh it too
-  if (typeof renderHistory === "function") renderHistory();
+  // Start listener AFTER initial render is done
+  initAuthListener();
 }
 
 // ── Onboarding save to DB ─────────────────────────────────────
 const _originalCompleteOnboarding = window.completeOnboarding;
+
 window.completeOnboardingWithSave = async function () {
   const overlay = document.getElementById("onboard-complete-overlay");
   if (overlay) overlay.style.display = "flex";
 
   DD.profile = buildProfileFromAnswers(onboardAnswers);
 
+  // Save to DB in background — don't await
   if (FD_Auth.isLoggedIn()) {
     const skinProfileData = {
       skinType: DD.profile.skinType,
       concerns: DD.profile.concerns,
       sensitivity: DD.profile.sensitivity,
     };
-    await saveOnboardingAnswers(
+    saveOnboardingAnswers(
       FD_Auth.currentUser.id,
       onboardAnswers,
       skinProfileData,
-    );
+    ).catch((e) => console.error("onboarding save error:", e));
   }
 
+  // Always navigate after 1.5s regardless of DB save
   setTimeout(() => {
     if (overlay) overlay.style.display = "none";
-    document.getElementById("page-onboarding").classList.remove("active");
-    document.getElementById("nav").style.display = "flex";
+    document.getElementById("page-onboarding")?.classList.remove("active");
+    const nav = document.getElementById("nav");
+    if (nav) nav.style.display = "flex";
     showPage("dashboard");
     renderDashboard();
-  }, 2000);
+  }, 1500);
 };
+
+// ── Save scan to Supabase ─────────────────────────────────────
+async function saveScanToDB(product, isSaved = false) {
+  if (!_fdClient || !FD_Auth.isLoggedIn()) return;
+  try {
+    const { data, error } = await _fdClient
+      .from("scan_history")
+      .insert({
+        user_id: FD_Auth.currentUser.id,
+        product_name: product.name || "",
+        product_brand: product.brand || "",
+        product_type: product.type || "",
+        ingredients_raw: product.ingredients
+          ? product.ingredients.join(", ")
+          : "",
+        analysis_result: product, // store full product object here
+        overall_score: product.scores?.overall || null,
+        ingredient_quality: product.scores?.ingredientQuality || null,
+        skin_compatibility: product.scores?.skinCompatibility || null,
+        risk_score: product.scores?.risk || null,
+        is_saved: isSaved,
+        is_favorite: false,
+      })
+      .select()
+      .single();
+
+    if (error) console.error("saveScanToDB error:", error);
+    // Attach the DB-generated uuid back to the product so we can reference it later
+    if (data) product._dbId = data.id;
+    return data;
+  } catch (e) {
+    console.error("saveScanToDB error:", e);
+  }
+}
+
+async function markProductSaved(product, saved) {
+  if (!_fdClient || !FD_Auth.isLoggedIn()) return;
+  const dbId = product._dbId;
+  if (!dbId) return;
+  try {
+    await _fdClient
+      .from("scan_history")
+      .update({ is_saved: saved })
+      .eq("id", dbId)
+      .eq("user_id", FD_Auth.currentUser.id);
+  } catch (e) {
+    console.error("markProductSaved error:", e);
+  }
+}
+
+// ── Load scan history from Supabase ──────────────────────────
+async function loadScansFromDB() {
+  if (!_fdClient || !FD_Auth.isLoggedIn()) return;
+  try {
+    const { data, error } = await _fdClient
+      .from("scan_history")
+      .select("*")
+      .eq("user_id", FD_Auth.currentUser.id)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (error) {
+      console.error("loadScansFromDB error:", error);
+      return;
+    }
+
+    if (data?.length) {
+      // analysis_result holds the full product object we stored
+      DD.state.scanHistory = data.map((row) => ({
+        ...row.analysis_result,
+        _dbId: row.id, // keep DB uuid attached
+      }));
+      DD.state.savedProducts = data
+        .filter((r) => r.is_saved === true)
+        .map((r) => ({ ...r.analysis_result, _dbId: r.id }));
+      DD.state.favorites = data
+        .filter((r) => r.is_favorite === true)
+        .map((r) => r._dbId || r.id);
+      saveState();
+      renderDashboard();
+      console.log("Loaded", data.length, "scans from DB");
+    }
+  } catch (e) {
+    console.error("loadScansFromDB error:", e);
+  }
+}
+window.signOut = signOut;

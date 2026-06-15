@@ -3,6 +3,8 @@
 
 // ── Persist state to localStorage ────────────────────────────
 function saveState() {
+  // Only persist data for logged-in users
+  if (!FD_Auth?.isLoggedIn()) return;
   try {
     localStorage.setItem(
       "fd-state",
@@ -16,6 +18,8 @@ function saveState() {
 }
 
 function loadState() {
+  // Only load persisted data for logged-in users
+  if (!FD_Auth?.isLoggedIn()) return;
   try {
     const saved = localStorage.getItem("fd-state");
     if (!saved) return;
@@ -35,7 +39,7 @@ function getOnboardingQuestionList() {
 
 function getDefaultProfile() {
   return {
-    name: "Rakshika",
+    name: "",
     age: "",
     gender: "",
 
@@ -336,6 +340,11 @@ function onboardBack() {
 }
 
 function completeOnboarding() {
+  // If DB-saving version is available, use it instead
+  if (window.completeOnboardingWithSave) {
+    window.completeOnboardingWithSave();
+    return;
+  }
   const overlay = document.getElementById("onboard-complete-overlay");
   overlay.style.display = "flex";
   setTimeout(() => {
@@ -349,21 +358,28 @@ function completeOnboarding() {
 
 // ── Dashboard ─────────────────────────────────────────────
 function renderDashboard() {
-  const profile = DD.profile || getDefaultProfile();
-  document.getElementById("dash-greeting-name").textContent =
-    profile.name || "Rakshika";
-  document.getElementById("dash-skin-type").textContent =
-    getDisplaySkinType(profile);
+  const profile = FD_Auth?.isLoggedIn() && DD.profile ? DD.profile : {};
+  const greetName = FD_Auth?.isLoggedIn()
+    ? FD_Auth.userProfile?.full_name?.split(" ")[0] || profile.name || "there"
+    : "there";
+  document.getElementById("dash-greeting-name").textContent = greetName;
+  document.getElementById("dash-skin-type").textContent = FD_Auth?.isLoggedIn()
+    ? getDisplaySkinType(profile) || "Complete your profile"
+    : "Sign in for your profile";
 
   const tagsEl = document.getElementById("dash-concern-tags");
-  const tags = [
-    ...getDisplayConcerns(profile),
-    ...getDisplaySensitivities(profile),
-  ];
-  tagsEl.innerHTML = tags
-    .slice(0, 3)
-    .map((t) => `<span class="badge badge-green">${t}</span>`)
-    .join("");
+  if (FD_Auth?.isLoggedIn()) {
+    const tags = [
+      ...getDisplayConcerns(profile),
+      ...getDisplaySensitivities(profile),
+    ];
+    tagsEl.innerHTML = tags
+      .slice(0, 3)
+      .map((t) => `<span class="badge badge-green">${t}</span>`)
+      .join("");
+  } else {
+    tagsEl.innerHTML = "";
+  }
 
   document.getElementById("stat-scans").textContent =
     DD.state.scanHistory.length;
@@ -379,6 +395,13 @@ function renderDashboard() {
 
   renderRecentHistory();
   renderRoutine();
+  renderSensitivityAlert();
+
+  // Hide CTA for logged-in users, show for guests
+  const ctaCard = document.getElementById("personalized-cta-card");
+  if (ctaCard) {
+    ctaCard.style.display = FD_Auth?.isLoggedIn() ? "none" : "block";
+  }
 }
 
 function renderRecentHistory() {
@@ -408,55 +431,38 @@ function renderRecentHistory() {
 }
 
 function renderRoutine() {
-  const routine = [
-    {
-      step: "AM",
-      name: "Cleanser",
-      product: "CeraVe Hydrating Cleanser",
-      compat: 98,
-      color: "jade",
-    },
-    {
-      step: "AM",
-      name: "Serum",
-      product: "TO Niacinamide 10%",
-      compat: 95,
-      color: "jade",
-    },
-    {
-      step: "AM",
-      name: "Moisturizer",
-      product: "Neutrogena Hydro Boost",
-      compat: 88,
-      color: "jade",
-    },
-    {
-      step: "PM",
-      name: "Serum",
-      product: "Retinol 0.2%",
-      compat: 72,
-      color: "amber",
-    },
-    {
-      step: "PM",
-      name: "Moisturizer",
-      product: "The Inkey List Omega Water Cream",
-      compat: 91,
-      color: "jade",
-    },
-  ];
-  document.getElementById("routine-list").innerHTML = routine
-    .map(
-      (r, i) =>
-        `<div class="routine-item">
-      <div class="routine-step">${r.step}</div>
-      <div class="routine-info">
-        <div class="routine-name">${r.name}</div>
-        <div class="routine-product">${r.product}</div>
-      </div>
-      <div class="routine-compat" style="color:var(--${r.color === "jade" ? "jade" : "amber"})">${r.compat}%</div>
-    </div>`,
-    )
+  const container = document.getElementById("routine-list");
+  if (!container) return;
+
+  if (!FD_Auth?.isLoggedIn()) {
+    container.innerHTML = `<div style="text-align:center;padding:24px;color:var(--text-muted);font-size:13px">
+      Sign in and complete your skin profile to get a personalized routine check.
+    </div>`;
+    return;
+  }
+
+  if (!DD.state.savedProducts.length) {
+    container.innerHTML = `<div style="text-align:center;padding:24px;color:var(--text-muted);font-size:13px">
+      Save products from your analysis to see routine compatibility here.
+    </div>`;
+    return;
+  }
+
+  container.innerHTML = DD.state.savedProducts
+    .slice(0, 5)
+    .map((p) => {
+      const compat = p.scores?.skinCompatibility || 0;
+      const color = compat >= 8 ? "jade" : compat >= 5 ? "amber" : "coral";
+      return `
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div style="font-size:20px">${p.emoji || "🧪"}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.name}</div>
+          <div style="font-size:11px;color:var(--text-muted)">${p.brand}</div>
+        </div>
+        <div style="font-size:13px;font-weight:700;color:var(--${color})">${compat.toFixed(0)}%</div>
+      </div>`;
+    })
     .join("");
 }
 
@@ -907,7 +913,7 @@ function analyzeIngredientList(ingredientList) {
   const knownCount = good.length + bad.length + warn.length;
 
   // ── Profile-aware scoring ──────────────────────────────
-  const profile = DD.profile || {};
+  const profile = FD_Auth?.isLoggedIn() && DD.profile ? DD.profile : {};
   const skinType = profile.skinType?.skinTypeSelf?.toLowerCase() || "";
   const userConcerns = (profile.concerns?.biggestConcerns || []).map((c) =>
     c.toLowerCase(),
@@ -1092,7 +1098,7 @@ async function analyzeText() {
   const key = typeof FD_CONFIG !== "undefined" ? FD_CONFIG.groqApiKey : "";
 
   // Build profile context for Groq
-  const profile = DD.profile || {};
+  const profile = FD_Auth?.isLoggedIn() && DD.profile ? DD.profile : {};
   const skinType = profile.skinType?.skinTypeSelf || "Not specified";
   const concerns =
     (profile.concerns?.biggestConcerns || []).join(", ") || "None";
@@ -1237,8 +1243,12 @@ Return ONLY this exact JSON (no markdown, no extra text):
   setTimeout(() => {
     hideLoading();
     DD.state.currentProduct = analyzed;
-    DD.state.scanHistory.unshift(analyzed);
-    saveState();
+    if (FD_Auth?.isLoggedIn()) {
+      DD.state.scanHistory.unshift(analyzed);
+      saveState();
+      // Also save to Supabase for cross-device sync
+      if (typeof saveScanToDB === "function") saveScanToDB(analyzed);
+    }
     showPage("analysis");
     renderAnalysis(analyzed);
   }, 3600);
@@ -2068,27 +2078,42 @@ function hideLoading() {
 
 // ── Profile Page ──────────────────────────────────────────
 function renderProfile() {
-  const profile = DD.profile || {};
+  const profile = FD_Auth?.isLoggedIn() && DD.profile ? DD.profile : {};
   const state = DD.state || {};
-
-  const name = profile.name || "User";
-  const skinType = profile.skinType || "Not set";
-  const concerns = profile.concerns || [];
-  const sensitivities = profile.sensitivities || [];
-  const goals = profile.goals || ["General Skin Health"];
-
-  const avatar = name.charAt(0).toUpperCase();
-
   const setText = (id, value) => {
     const el = document.getElementById(id);
     if (el) el.textContent = value;
   };
+  const fragToggle = document.getElementById("pref-fragrance-toggle");
+  if (fragToggle) {
+    fragToggle.checked =
+      localStorage.getItem("pref-fragrance-alert") !== "false";
+  }
 
-  setText("profile-name", name);
+  // Use auth data for name/email — not DD.profile
+  const isLoggedIn = FD_Auth?.isLoggedIn();
+  const fullName = isLoggedIn
+    ? FD_Auth.userProfile?.full_name || profile.name || "User"
+    : "Guest";
+  const email = isLoggedIn
+    ? FD_Auth.currentUser?.email || "—"
+    : "Sign in to save your profile";
+  const avatar = fullName.charAt(0).toUpperCase();
+
+  // Skin data from onboarding
+  const skinType = getDisplaySkinType(profile) || "Not set";
+  const concerns = getDisplayConcerns(profile) || [];
+  const sensitivities = getDisplaySensitivities(profile) || [];
+  const goals = profile.productCompatibility?.skincareGoal || [
+    "General Skin Health",
+  ];
+
+  setText("profile-name", fullName);
+  setText("profile-email", email);
   setText("profile-avatar", avatar);
   setText("profile-skin-type", skinType);
   setText("profile-skin-type-badge", `${skinType} Skin`);
-  setText("profile-goal", Array.isArray(goals) ? goals[0] : goals);
+  setText("profile-goal-badge", Array.isArray(goals) ? goals[0] : goals);
   setText(
     "profile-sensitivity-level",
     sensitivities.length ? "Moderate" : "Low",
@@ -2096,7 +2121,13 @@ function renderProfile() {
 
   setText("profile-stat-scans", state.scanHistory?.length || 0);
   setText("profile-stat-saved", state.savedProducts?.length || 0);
-  setText("profile-stat-avoided", state.avoidedProducts?.length || 0);
+  setText(
+    "profile-stat-avoided",
+    state.scanHistory?.reduce(
+      (acc, p) => acc + (p.badIngredients?.length || 0),
+      0,
+    ) || 0,
+  );
   setText("profile-stat-favorites", state.favorites?.length || 0);
 
   const concernsWrap = document.getElementById("profile-concerns");
@@ -2105,7 +2136,7 @@ function renderProfile() {
       ? concerns
           .map((c) => `<span class="badge badge-blue">${c}</span>`)
           .join("")
-      : `<span class="badge">No concerns added</span>`;
+      : `<span class="badge">Complete your skin profile to see concerns</span>`;
   }
 
   const sensWrap = document.getElementById("profile-sensitivities");
@@ -2114,7 +2145,7 @@ function renderProfile() {
       ? sensitivities
           .map((s) => `<span class="badge badge-red">${s}</span>`)
           .join("")
-      : `<span class="badge badge-green">No sensitivities</span>`;
+      : `<span class="badge badge-green">No sensitivities detected</span>`;
   }
 }
 
@@ -2143,3 +2174,87 @@ document.addEventListener("DOMContentLoaded", () => {
   // Auth handles routing — initAuth() called from index.html
   DD.profile = DD.profile || getDefaultProfile();
 });
+
+function renderSensitivityAlert() {
+  const container = document.getElementById("sensitivity-alert-section");
+  if (!container) return;
+
+  // Only show if logged in
+  if (!FD_Auth?.isLoggedIn()) {
+    container.innerHTML = "";
+    return;
+  }
+
+  const profile = DD.profile || {};
+  const fragranceSensitive = profile.sensitivity?.fragranceSensitive === "Yes";
+  const sensitivityLevel = profile.sensitivity?.sensitivityLevel || "";
+  const isHighSensitivity =
+    sensitivityLevel.toLowerCase().includes("high") ||
+    sensitivityLevel.toLowerCase().includes("very");
+
+  // Check preferences toggle — default to only showing if user set fragrance sensitive
+  const fragranceAlertPref =
+    localStorage.getItem("pref-fragrance-alert") !== "false";
+
+  if (!fragranceSensitive && !isHighSensitivity) {
+    container.innerHTML = "";
+    return;
+  }
+
+  if (!fragranceAlertPref) {
+    container.innerHTML = "";
+    return;
+  }
+
+  // Find flagged products from scan history
+  const flaggedProducts = DD.state.scanHistory.filter((p) =>
+    (p.badIngredients || []).some(
+      (i) =>
+        i.toLowerCase().includes("fragrance") ||
+        i.toLowerCase().includes("parfum"),
+    ),
+  );
+
+  // Find other sensitivities from profile
+  const otherSensitivities = (
+    profile.sensitivity?.commonReactions || []
+  ).filter((s) => s && s !== "None" && s !== "Not Sure");
+
+  const alerts = [];
+
+  if (fragranceSensitive && flaggedProducts.length > 0) {
+    alerts.push(
+      `${flaggedProducts.length} recently scanned product${flaggedProducts.length > 1 ? "s contain" : " contains"} <strong style="color:var(--coral)">Fragrance</strong> — a known irritant for your skin.`,
+    );
+  }
+
+  if (otherSensitivities.length > 0) {
+    alerts.push(
+      `You have noted sensitivities to: <strong style="color:var(--amber)">${otherSensitivities.join(", ")}</strong>. Watch out for these in your scans.`,
+    );
+  }
+
+  if (alerts.length === 0) {
+    container.innerHTML = "";
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="card p-24" style="background:linear-gradient(135deg,rgba(255,107,107,0.08),rgba(245,166,35,0.08));border-color:rgba(255,107,107,0.2)">
+      <div style="display:flex;align-items:flex-start;gap:16px">
+        <div style="font-size:28px">⚠️</div>
+        <div style="flex:1">
+          <div style="font-weight:700;margin-bottom:8px">Sensitivity Alert</div>
+          ${alerts
+            .map(
+              (a) => `
+            <div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:6px">${a}</div>
+          `,
+            )
+            .join("")}
+          <button class="btn btn-secondary btn-sm" style="margin-top:10px" onclick="showPage('history');renderHistory();">View Flagged Products →</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
